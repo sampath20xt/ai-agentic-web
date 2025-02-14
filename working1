@@ -1,0 +1,88 @@
+#complete working file
+import time
+from typing import Dict, Optional
+from pydantic import BaseModel
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.firefox.service import Service
+from selenium.webdriver.firefox.options import Options
+from webdriver_manager.firefox import GeckoDriverManager
+from langgraph.graph import StateGraph, END
+
+
+class TrackingState(BaseModel):
+    mawb_number: str
+    tracking_result: Optional[str] = None
+
+
+def user_input_agent(state: TrackingState) -> Dict:
+    print(f"Received MAWB Number: {state.mawb_number}")
+    return {"mawb_number": state.mawb_number}
+
+
+def track_cargo(state: TrackingState) -> Dict:
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+
+    driver = webdriver.Firefox(service=Service(GeckoDriverManager().install()), options=options)
+
+    try:
+        driver.get("https://www.track-trace.com/aircargo")
+        time.sleep(5)
+
+        search_box = driver.find_element(By.CSS_SELECTOR, "input[placeholder='Enter number...']")
+        search_box.send_keys(state.mawb_number)
+
+        track_button = driver.find_element(By.ID, "wc-multi-form-button_options")
+        track_button.click()
+
+        time.sleep(15)
+        driver.switch_to.window(driver.window_handles[-1])
+
+        try:
+            iframe_element = WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.NAME, "frame-202"))
+            )
+            driver.switch_to.frame(iframe_element)
+            print("✅ Switched to tracking iframe.")
+        except Exception as e:
+            print(f"❌ Error: Tracking iframe not found. {e}")
+            driver.quit()
+            return {"status": "error", "message": "Tracking iframe not found"}
+
+        time.sleep(10)
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(5)
+
+        try:
+            tracking_data = driver.find_element(By.TAG_NAME, "body").text
+            print("\n✅ Final Extracted Tracking Data:")
+            print(tracking_data)
+            return {"mawb_number": state.mawb_number, "tracking_result": tracking_data}
+        except Exception as e:
+            print(f"❌ Error: Unable to extract tracking data. {e}")
+            return {"mawb_number": state.mawb_number, "tracking_result": "Extraction Failed"}
+
+    finally:
+        driver.quit()
+
+
+graph = StateGraph(TrackingState)
+graph.add_node("user_input_agent", user_input_agent)
+graph.add_node("track_cargo", track_cargo)
+graph.set_entry_point("user_input_agent")
+graph.add_edge("user_input_agent", "track_cargo")
+graph.add_edge("track_cargo", END)
+agent_graph = graph.compile()
+
+if __name__ == "__main__":
+    mawb_number = input("Enter MAWB Number: ")
+    initial_state = TrackingState(mawb_number=mawb_number)
+    result = agent_graph.invoke(initial_state)
+
+    print("\n✅ Final Extracted Tracking Data:")
+    print(result.get("tracking_result", "No Data Extracted"))
