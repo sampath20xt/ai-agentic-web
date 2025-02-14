@@ -1,0 +1,169 @@
+import time
+from typing import Dict, Optional, List, Annotated
+from typing_extensions import TypedDict
+from pydantic import BaseModel
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.firefox.service import Service
+from selenium.webdriver.firefox.options import Options
+from webdriver_manager.firefox import GeckoDriverManager
+from langgraph.graph import StateGraph, END, START
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_groq import ChatGroq
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+groq_api_key = os.getenv("GROQ_API_KEY")
+
+# Initialize LLM with Groq
+llm = ChatGroq(groq_api_key=groq_api_key, model_name="Gemma2-9b-It")
+
+# Define agentic state structure
+class TrackingState(TypedDict):
+    mawb_number: str
+    tracking_result: Optional[str]
+    summary: Optional[str]
+
+# Define user input agent
+def user_input_agent(state: TrackingState) -> TrackingState:
+    """Processes user input and returns the initial tracking state."""
+    print("\n🔹 **User Input Agent Processing...**")
+    print(f"📌 Received MAWB Number: {state['mawb_number']}\n")
+    return state
+
+# Define tracking agent
+def track_cargo(state: TrackingState) -> TrackingState:
+    """Tracks the cargo based on the MAWB number and returns tracking data."""
+    print("\n🔹 **Tracking Agent Processing...**")
+
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+
+    driver = webdriver.Firefox(service=Service(GeckoDriverManager().install()), options=options)
+
+    try:
+        print("🌍 Navigating to Tracking Website...")
+        driver.get("https://www.track-trace.com/aircargo")
+        time.sleep(5)
+
+        search_box = driver.find_element(By.CSS_SELECTOR, "input[placeholder='Enter number...']")
+        search_box.send_keys(state["mawb_number"])
+
+        track_button = driver.find_element(By.ID, "wc-multi-form-button_options")
+        track_button.click()
+
+        time.sleep(15)
+        driver.switch_to.window(driver.window_handles[-1])
+
+        try:
+            iframe_element = WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.NAME, "frame-202"))
+            )
+            driver.switch_to.frame(iframe_element)
+            print("✅ **Switched to tracking iframe.**")
+        except Exception as e:
+            print(f"❌ **Error:** Tracking iframe not found. {e}")
+            driver.quit()
+            return {"mawb_number": state["mawb_number"], "tracking_result": "Error: Tracking iframe not found"}
+
+        time.sleep(10)
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(5)
+
+        try:
+            tracking_data = driver.find_element(By.TAG_NAME, "body").text
+            print("\n✅ **Tracking Data Extracted Successfully!**")
+            return {"mawb_number": state["mawb_number"], "tracking_result": tracking_data}
+        except Exception as e:
+            print(f"❌ **Error:** Unable to extract tracking data. {e}")
+            return {"mawb_number": state["mawb_number"], "tracking_result": "Extraction Failed"}
+
+    finally:
+        driver.quit()
+
+# Define summarization agent
+def summarize_tracking(state: TrackingState) -> TrackingState:
+    """Summarizes the latest tracking status from the extracted tracking data."""
+    print("\n🔹 **Summarization Agent Processing...**")
+
+    if not state["tracking_result"] or state["tracking_result"] == "Extraction Failed":
+        print("No valid tracking data found")
+        return {"summary": "No valid tracking data available."}
+
+    prompt = f"""
+    Extract the latest timestamp status from this cargo tracking data:
+    {state["tracking_result"]}
+
+    - Identify the most recent tracking update according to timestamp.
+    - Only give me details about the tracking status update of latest timestamp and nothing else.
+    """
+
+    try:
+        response = llm.invoke([{"role": "system", "content": prompt}])
+        summary = response["choices"][0]["message"]["content"].strip()
+        print(f"\n✅ **Latest Tracking Summary:** {summary}")
+        return {"summary": summary}
+
+    except Exception as e:
+        print(f"❌ **Error during summarization:** {e}")
+        return {"summary": "Summarization failed due to an API error."}
+
+# Define the chatbot function
+def chatbot(state: Dict) -> Dict:
+    """Processes messages with LLM and returns a response."""
+    return {"messages": [llm_with_tools.invoke(state["messages"])]}
+
+# Create a list of tools (functions)
+tools = [user_input_agent, track_cargo, summarize_tracking]
+
+# Bind tools to LLM
+llm_with_tools = llm.bind_tools(tools=tools)
+
+# Define the agent graph with ToolNodes
+graph_builder = StateGraph(TrackingState)
+
+graph_builder.add_node("user_input_agent", user_input_agent)
+graph_builder.add_node("track_cargo", track_cargo)
+graph_builder.add_node("summarize_tracking", summarize_tracking)
+graph_builder.add_node("chatbot", chatbot)
+
+# Tool node with tool functions
+tool_node = ToolNode(tools=tools)
+graph_builder.add_node("tools", tool_node)
+
+# Set entry point
+graph_builder.add_edge(START, "chatbot")
+
+# Define execution sequence
+graph_builder.add_conditional_edges(
+    "chatbot",
+    tools_condition([track_cargo]),
+)
+graph_builder.add_edge("tools", "chatbot")
+graph_builder.add_conditional_edges(
+    "track_cargo",
+    tools_condition([summarize_tracking]),
+)
+graph_builder.add_edge("summarize_tracking", END)
+
+# Compile the graph
+graph = graph_builder.compile()
+
+# Run the agentic process
+if __name__ == "__main__":
+    mawb_number = input("\n✈️ **Enter MAWB Number for Tracking:** ")
+    initial_state = TrackingState(mawb_number=mawb_number, tracking_result=None, summary=None)
+    result = graph.invoke(initial_state)
+
+    print("\n🔹 **Final Agent Processing Complete!**")
+    print("\n📦 **Tracking Data:**")
+    print(result.get("tracking_result", "No Data Extracted"))
+
+    print("\n📌 **Latest Status Update:**")
+    print(result.get("summary", "No Summary Available"))
